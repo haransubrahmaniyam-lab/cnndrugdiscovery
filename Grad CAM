@@ -1,0 +1,140 @@
+#Stage 5 : Applying a Grad Cam heatmap
+
+#1
+model.load_state_dict(torch.load("ligand_model4.pt"))
+model.eval()
+
+images, labels = next(iter(val_loader_Ligand))
+
+images = images.to(device)
+labels = labels.to(device)
+
+sample = images[0].unsqueeze(0)    #makes the batch dimension zero so it can be processed correctly
+label = labels[0]
+
+with torch.no_grad():
+    output = model(sample)
+
+prediction = output.argmax(dim=1)
+
+print("Prediction:", prediction.item())
+print("True label:", label.item())
+
+
+
+
+
+#2
+#Grad Cam
+
+import torch
+import torch.nn.functional as F
+
+class GradCAM:
+    def __init__(self, model, target_layer):         #takes trained cnn and last convolutional layer, since it retains spatial info and captures high level features    
+        self.model = model
+        self.target_layer = target_layer
+
+        self.activations = None  #stores feature maps
+        self.gradients = None    #stores gradients
+
+        self.forward_hook = target_layer.register_forward_hook(    #saves the feature map after forward pass
+            self.save_activation
+        )
+
+        self.backward_hook = target_layer.register_full_backward_hook(     #saves the gradients during backpropagation
+            self.save_gradient
+        )
+
+    def save_activation(self, module, input, output):
+        self.activations = output
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate(self, x, class_idx=None):       #generates heatmap
+
+        self.model.eval()                       #turns off dropout for evaluation purposes
+
+        
+        # Forward pass
+        output = self.model(x)
+
+        if class_idx is None:                    
+            class_idx = output.argmax(dim=1).item()    #choose target class - (which classification has model predicted)
+
+        self.model.zero_grad()               #zero gradients
+
+        # Backprop for chosen class
+        output[:, class_idx].backward()       
+
+        activations = self.activations       #save
+        gradients = self.gradients
+
+        # Number of rotations
+        n_rotations = x.shape[1]
+
+        heatmaps = []
+
+        for r in range(n_rotations):     #loop over rotations for the selected image
+ 
+            act = activations[r].unsqueeze(0)   #extract  feature maps and gradients
+            grad = gradients[r].unsqueeze(0)
+
+            # Global Average Pooling
+            weights = grad.mean(dim=(2,3), keepdim=True)  #average importance of feature map k, 
+
+            # Weighted sum
+            cam = (weights * act).sum(dim=1)    #each feature map is multiplied by its importance and then summed
+
+            # ReLU
+            cam = F.relu(cam)     #discarding negative contirbutions as they contirbute to evidence against the class
+
+            # Resize to original image size
+            cam = F.interpolate(
+                cam.unsqueeze(1),
+                size=(256,256),    #DEPENDING ON PIXELS
+                mode='bilinear',
+                align_corners=False
+            )
+
+            cam = cam.squeeze()
+
+            # Normalize
+            cam -= cam.min()
+
+            if cam.max() > 0:
+                cam /= cam.max()
+
+            heatmaps.append(cam.detach().cpu().numpy())
+
+        return heatmaps
+
+    def remove_hooks(self):
+        self.forward_hook.remove()
+        self.backward_hook.remove()
+
+
+#3
+gradcam = GradCAM(model, model.conv3)
+heatmaps = gradcam.generate(sample)
+target_layer = model.conv3
+
+import matplotlib.pyplot as plt
+
+fig, axes = plt.subplots(2, 4, figsize=(12,6))
+
+for r, ax in enumerate(axes.flat):
+
+    img = sample[0, r].permute(1,2,0).cpu().numpy()
+
+    ax.imshow(img)
+    ax.imshow(heatmaps[r], cmap='jet', alpha=0.4)
+
+    ax.set_title(f"Rotation {r}")
+    ax.axis('off')
+
+plt.tight_layout()
+plt.show()
+
+
